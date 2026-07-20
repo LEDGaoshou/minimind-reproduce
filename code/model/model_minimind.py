@@ -1,7 +1,7 @@
 from transformers import PretrainedConfig
 
-class MokioMindConfig(PretrainedConfig):
-    model_type = "mokiomind"
+class MinimindConfig(PretrainedConfig):
+    model_type = "minimind"
 
     def __init__(
         self,
@@ -206,6 +206,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     # 1. x[:, :, :, None, :]: 在第4维插入新维度 -> [bs, slen, num_kv_heads, 1, head_dim]
     # 2. .expand(...): 扩展第4维到n_rep -> [bs, slen, num_kv_heads, n_rep, head_dim]
     # 3. .reshape(...): 合并第3、4维 -> [bs, slen, num_kv_heads * n_rep, head_dim]
+    # 节省内存
     return (
         x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim)
         .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
@@ -220,7 +221,7 @@ class Attention(nn.Module):
     - GQA：key、value头数少于query头数，通过重复匹配
     - 优点：减少KV cache内存占用，保持性能
     """
-    def __init__(self, args: MiniMindConfig):
+    def __init__(self, args: MinimindConfig):
         super().__init__()
         
         # 处理GQA：如果没有指定kv头数，则使用与query相同的头数
