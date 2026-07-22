@@ -91,7 +91,7 @@ class RMSnorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
-        return torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps)
+        return x*torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps)
 
     def forward(self, x):
         return self.weight*self._norm(x.float()).type_as(x)
@@ -364,6 +364,7 @@ class FeedForward(nn.Module):
 class MiniMindBlock(nn.Module):
     def __init__(self,layer_id:int,config:MiniMindConfig):
         super().__init__()
+        # 初始化注意力层和前馈网络层
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim = self.hidden_size // self.num_attention_heads
@@ -375,7 +376,7 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config)
 
         def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-            residual = hidden_states
+            residual = hidden_states        # 残差连接
             hidden_states,present_key_value = self.self_attn(
                 self.input_layernorm(hidden_states),
                 position_embeddings=position_embeddings,
@@ -389,7 +390,8 @@ class MiniMindBlock(nn.Module):
 class MiniMindModel(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
-
+        self.config = config
+        # 初始化模型参数和层
         self.vocab_size = config.vocab_size,self.num_hidden_layers=(
                         config.num_hidden_layers,
                         config.vocab_size,
@@ -410,15 +412,16 @@ class MiniMindModel(nn.Module):
             rope_base=config.rope_theta,
             rope_scaling=config.rope_scaling,
         )
+        # 缓存frequencies作为buffer，persistent=False表示不保存到state_dict中
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
         def forward(self, input_ids:Optional[torch.Tensor]=None, attention_mask:Optional[torch.Tensor]=None, past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None, use_cache:bool=False,**kwargs):
             batch_size, seq_len = input_ids.shape
-           
+
+            # 初始化缓存 
             if hasattr(past_key_values, 'layers'):
                past_key_values = None
-           
             past_key_values = past_key_values or [None] * len(self.layers)
 
             start_pos = (
@@ -426,12 +429,12 @@ class MiniMindModel(nn.Module):
             )
 
             hidden_states = self.dropout(self.embed_tokens(input_ids))
-
+            # 位置编码
             position_embeddings = (
                self.freqs_cos[start_pos : start_pos + seq_len], 
                self.freqs_sin[start_pos : start_pos + seq_len],
              )
-           
+           # 调用Block层进行前向传播
             presents = []
 
             for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
@@ -447,4 +450,41 @@ class MiniMindModel(nn.Module):
             hidden_states = self.norm(hidden_states)
 
             return hidden_states, presents
-            
+
+class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+
+    def __init__(self,config:MiniMindConfig):
+        super().__init__(config)
+        self.model = MiniMindModel(config)
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+
+        # 权重共享
+        # 输出层的权重和嵌入层的权重共享
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+        
+
+    def forward(self, input_ids:Optional[torch.Tensor]=None, attention_mask:Optional[torch.Tensor]=None, past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None, use_cache:bool=False,Logits_to_keep:Union[int,torch.Tensor]=0,**args):
+        hidden_states,past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args
+        )
+        # logits_to_keep是整数，那就保留最后n个位置
+        # 生成的时候只需要最后的logits来预测下一个token
+        slice_indices = (
+            slice(-Logits_to_keep, None) 
+            if isinstance(Logits_to_keep,int) 
+            else Logits_to_keep
+        )
+        Logits = self.lm_head(hidden_states)[:, slice_indices, :]
+
+        return CausalLMOutputWithPast(
+            logits=Logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+            attentions=None,
+        )
