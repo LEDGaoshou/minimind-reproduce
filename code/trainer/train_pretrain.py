@@ -67,7 +67,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             scaler.update()  # 更新缩放器
             optimizer.zero_grad(set_to_none=True)  # 清零梯度
 
-        if step % args.log_interval == 0 or step == iters - 1:
+        if step % args.log_interval == 0 or step == iters - 1 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值
             current_lr = optimizer.param_groups[-1]["lr"]  # 当前学习率
@@ -84,7 +84,9 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                     {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
                 )
 
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (
+            step % args.save_interval == 0 or step == iters - 1 or step == iters
+        ) and is_main_process():
             model.eval()  # 切换到评估模式
 
             # 构建保存路径
@@ -191,9 +193,16 @@ if __name__ == "__main__":
     )
 
     # ========== 实验跟踪参数 ==========
-    parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
+    parser.add_argument("--use_wandb", action="store_true", help="是否使用swanlab实验跟踪")
     parser.add_argument(
-        "--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名"
+        "--wandb_mode",
+        type=str,
+        default="local",
+        choices=["local", "online", "offline"],
+        help="swanlab运行模式：local=数据存本地(默认，无需登录)；online=上传swanlab.cn(需先swanlab login)；offline=仅存本地待sync上传",
+    )
+    parser.add_argument(
+        "--wandb_project", type=str, default="MiniMind-Pretrain", help="swanlab项目名"
     )
 
     # 解析命令行参数
@@ -267,18 +276,36 @@ if __name__ == "__main__":
     wandb = None
     if args.use_wandb and is_main_process():
         # 使用SwanLab作为WandB的替代
-        import swanlab as wandb
+        try:
+            import swanlab as wandb
+        except ImportError as e:
+            Logger(f"swanlab 未安装：{e}。执行 `pip install swanlab` 后再使用 --use_wandb")
+            wandb = None
+        else:
+            # 📚 实验恢复知识点
+            # 如果有检查点数据，获取之前的wandb_id来恢复实验
+            wandb_id = ckp_data.get("wandb_id") if ckp_data else None
+            resume = "must" if wandb_id else None  # 必须恢复到指定实验
 
-        # 📚 实验恢复知识点
-        # 如果有检查点数据，获取之前的wandb_id来恢复实验
-        wandb_id = ckp_data.get("wandb_id") if ckp_data else None
-        resume = "must" if wandb_id else None  # 必须恢复到指定实验
-
-        # 构建实验名称，包含关键超参数
-        wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-        wandb.init(
-            project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume
-        )
+            # 构建实验名称，包含关键超参数
+            wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+            try:
+                wandb.init(
+                    project=args.wandb_project,
+                    name=wandb_run_name,
+                    id=wandb_id,
+                    resume=resume,
+                    mode=args.wandb_mode,
+                )
+                Logger(f"swanlab 初始化成功（mode={args.wandb_mode}，project={args.wandb_project}）")
+                if args.wandb_mode == "local":
+                    Logger("本地查看：运行 `swanlab watch` 或访问 http://127.0.0.1:5092 （数据在 ./swanlog）")
+            except Exception as e:
+                # 初始化失败（如 online 模式未登录）不中断训练，仅关闭实验跟踪
+                Logger(f"swanlab 初始化失败（mode={args.wandb_mode}）：{e}")
+                if args.wandb_mode == "online":
+                    Logger("提示：online 模式需先执行 `swanlab login` 登录；改用 --wandb_mode local 可本地记录")
+                wandb = None
 
     # ========== 5. 定义模型、数据、优化器 ==========
     """
@@ -292,7 +319,9 @@ if __name__ == "__main__":
     # 初始化模型和分词器
     model, tokenizer = init_model(lm_config, args.from_weight, tokenizer_path=args.tokenizer_path, device=args.device)
 
+    Logger(f"加载数据集：{args.data_path} ...")
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    Logger(f"数据集加载完成，共 {len(train_ds)} 条样本")
 
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
 
@@ -350,3 +379,11 @@ if __name__ == "__main__":
                 pin_memory=True,
             )
             train_epoch(epoch, loader, len(loader), 0, wandb)
+
+    # ========== 收尾 ==========
+    moe_suffix = (
+        "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
+    )
+    Logger(
+        f"训练完成：共 {args.epochs} 个 epoch，权重保存至 {args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+    )

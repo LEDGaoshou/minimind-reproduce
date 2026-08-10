@@ -15,7 +15,7 @@ def is_main_process():
 # 日志
 def Logger(content):
     if is_main_process():
-        print(content)
+        print(content, flush=True)  # flush=True：避免管道/重定向时输出被缓冲而不可见
 
 
 # 动态学习率计算
