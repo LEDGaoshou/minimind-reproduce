@@ -20,6 +20,7 @@ class MiniMindConfig(PretrainedConfig):
         rope_theta: int = 1000000,
         inference_rope_scaling: bool = False,
         flash_attention: bool = True,
+        flash_attn: bool = True,
         ############ MoE ############
         use_moe: bool = False,
         num_experts_per_tok: int = 2,
@@ -56,6 +57,7 @@ class MiniMindConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.aux_loss_alpha = aux_loss_alpha
         self.scoring_func = scoring_func
+        self.flash_attn = flash_attn
 
         self.rope_scaling = (
             {
@@ -277,10 +279,10 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
-        # position_embeddings是预计算的(cos, sin)，按序列位置切片并应用RoPE
+        # position_embeddings是预计算的(cos, sin)，已按绝对位置切片，直接应用RoPE
+        # 注意：不能再按seq_len截断，否则inference带KV cache时位置编码会从0重新开始
         cos, sin = position_embeddings
-        # 只取当前序列长度的前缀（用于inference时从start_pos开始）
-        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
         # -------------------- KV cache 处理 --------------------
         # past_key_value: (past_k, past_v) 或 None
@@ -375,27 +377,25 @@ class MiniMindBlock(nn.Module):
         self.post_attention_layernorm = RMSnorm(self.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config)
 
-        def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-            residual = hidden_states        # 残差连接
-            hidden_states,present_key_value = self.self_attn(
-                self.input_layernorm(hidden_states),
-                position_embeddings=position_embeddings,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attention_mask=attention_mask
-            )
-            hidden_states = residual + hidden_states
-            hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
-            return hidden_states,present_key_value
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        residual = hidden_states        # 残差连接
+        hidden_states,present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings=position_embeddings,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            attention_mask=attention_mask
+        )
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states,present_key_value
 class MiniMindModel(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
         # 初始化模型参数和层
-        self.vocab_size = config.vocab_size,self.num_hidden_layers=(
-                        config.num_hidden_layers,
-                        config.vocab_size,
-        )
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 
         self.dropout = nn.Dropout(config.dropout)
@@ -416,40 +416,40 @@ class MiniMindModel(nn.Module):
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
-        def forward(self, input_ids:Optional[torch.Tensor]=None, attention_mask:Optional[torch.Tensor]=None, past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None, use_cache:bool=False,**kwargs):
-            batch_size, seq_len = input_ids.shape
+    def forward(self, input_ids:Optional[torch.Tensor]=None, attention_mask:Optional[torch.Tensor]=None, past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None, use_cache:bool=False,**kwargs):
+        batch_size, seq_len = input_ids.shape
 
-            # 初始化缓存 
-            if hasattr(past_key_values, 'layers'):
-               past_key_values = None
-            past_key_values = past_key_values or [None] * len(self.layers)
+        # 初始化缓存
+        if hasattr(past_key_values, 'layers'):
+            past_key_values = None
+        past_key_values = past_key_values or [None] * len(self.layers)
 
-            start_pos = (
-               past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        start_pos = (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        # 位置编码
+        position_embeddings = (
+            self.freqs_cos[start_pos : start_pos + seq_len],
+            self.freqs_sin[start_pos : start_pos + seq_len],
+        )
+        # 调用Block层进行前向传播
+        presents = []
+
+        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+            hidden_states, present_key_value = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
             )
+            presents.append(present_key_value)
 
-            hidden_states = self.dropout(self.embed_tokens(input_ids))
-            # 位置编码
-            position_embeddings = (
-               self.freqs_cos[start_pos : start_pos + seq_len], 
-               self.freqs_sin[start_pos : start_pos + seq_len],
-             )
-           # 调用Block层进行前向传播
-            presents = []
+        hidden_states = self.norm(hidden_states)
 
-            for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
-                hidden_states, present_key_value = layer(
-                     hidden_states,
-                     position_embeddings=position_embeddings,
-                     past_key_value=past_key_value,
-                     use_cache=use_cache,
-                     attention_mask=attention_mask,
-                )
-                presents.append(present_key_value)
-            
-            hidden_states = self.norm(hidden_states)
-
-            return hidden_states, presents
+        return hidden_states, presents
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MiniMindConfig
@@ -465,7 +465,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
 
         
 
-    def forward(self, input_ids:Optional[torch.Tensor]=None, attention_mask:Optional[torch.Tensor]=None, past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None, use_cache:bool=False,Logits_to_keep:Union[int,torch.Tensor]=0,**args):
+    def forward(self, input_ids:Optional[torch.Tensor]=None, attention_mask:Optional[torch.Tensor]=None, labels:Optional[torch.Tensor]=None, past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None, use_cache:bool=False,Logits_to_keep:Union[int,torch.Tensor]=0,**args):
         hidden_states,past_key_values = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -473,16 +473,30 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **args
         )
-        # logits_to_keep是整数，那就保留最后n个位置
-        # 生成的时候只需要最后的logits来预测下一个token
-        slice_indices = (
-            slice(-Logits_to_keep, None) 
-            if isinstance(Logits_to_keep,int) 
-            else Logits_to_keep
-        )
-        Logits = self.lm_head(hidden_states)[:, slice_indices, :]
+        Logits = self.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            # 训练模式：计算 shift-CE loss，pad 位置在 labels 中为 -100，被 ignore_index 忽略
+            shift_logits = Logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+        else:
+            # 生成模式：logits_to_keep是整数，那就保留最后n个位置
+            # 生成的时候只需要最后的logits来预测下一个token
+            slice_indices = (
+                slice(-Logits_to_keep, None)
+                if isinstance(Logits_to_keep, int)
+                else Logits_to_keep
+            )
+            Logits = Logits[:, slice_indices, :]
 
         return CausalLMOutputWithPast(
+            loss=loss,
             logits=Logits,
             past_key_values=past_key_values,
             hidden_states=hidden_states,
