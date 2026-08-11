@@ -128,7 +128,7 @@ if __name__ == "__main__":
 
     # ========== 基础训练参数 ==========
     parser.add_argument(
-        "--save_dir", type=str, default="../out", help="模型保存目录"
+        "--save_dir", type=str, default="./out", help="模型保存目录"
     )  # ！修正：原"out"缺少../前缀
     parser.add_argument(
         "--save_weight", default="pretrain", type=str, help="保存权重的前缀名"
@@ -197,7 +197,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wandb_mode",
         type=str,
-        default="local",
+        default="online",
         choices=["local", "online", "offline"],
         help="swanlab运行模式：local=数据存本地(默认，无需登录)；online=上传swanlab.cn(需先swanlab login)；offline=仅存本地待sync上传",
     )
