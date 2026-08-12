@@ -129,7 +129,7 @@ def init_model(
     lm_config,
     from_weight="pretrain",
     tokenizer_path=None,
-    save_dir="../out",
+    save_dir="./out",
     device="cuda",
 ):
     from transformers import AutoTokenizer

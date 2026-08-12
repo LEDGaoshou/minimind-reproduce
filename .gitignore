@@ -220,3 +220,4 @@ __marimo__/
 # train data
 data/
 out/
+swanlog/
