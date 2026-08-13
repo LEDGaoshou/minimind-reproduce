@@ -35,6 +35,7 @@ warnings.filterwarnings("ignore")
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()  # 记录epoch开始时间
+    last_step = start_step
 
     # 遍历数据批次循环
     for step, (input_ids, labels) in enumerate(
@@ -43,6 +44,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         # 将数据移动到指定设备，一般是GPU
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
+        last_step = step
 
         lr = get_lr(
             epoch * iters + step, args.epochs * iters, args.learning_rate
@@ -59,8 +61,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             loss=loss/args.accumulation_steps  # 平均化损失，适应梯度累积
         # 反向传播    
         scaler.scale(loss).backward()
-        # 梯度累积
-        if (step+1)%args.accumulation_steps==0:
+        # 梯度累积（step从1数起，故用 step % acc == 0 对齐累积窗口）
+        if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)  # 在梯度裁剪前取消缩放
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  
             scaler.step(optimizer)  # 更新参数
@@ -121,6 +123,14 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             )
 
             model.train()  # 恢复训练模式
+
+    # epoch末尾：flush 余数梯度（总batch数不是accumulation_steps倍数时）
+    if last_step > start_step and last_step % args.accumulation_steps != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
 
 
 if __name__ == "__main__":
