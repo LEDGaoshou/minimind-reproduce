@@ -142,6 +142,7 @@ def init_model(
     tokenizer_path=None,
     save_dir="./out",
     device="cuda",
+    is_mini=True
 ):
     from transformers import AutoTokenizer
     from model.model_minimind import MiniMindForCausalLM
@@ -161,9 +162,14 @@ def init_model(
         moe_suffix = (
             "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
         )
-        weight_path = (
-            f"{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
-        )
+        if is_mini:
+            weight_path = (
+                f"{save_dir}/{from_weight}_mini_{lm_config.hidden_size}{moe_suffix}.pth"
+            )
+        else:
+            weight_path = (
+                f"{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+            )
 
         weights = torch.load(weight_path, map_location=device)
 
