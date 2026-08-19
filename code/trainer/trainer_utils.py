@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import Sampler
-
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 def get_model_params(model, config):
     total = sum(p.numel() for p in model.parameters()) / 1e6
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
@@ -68,13 +68,15 @@ def lm_checkpoint(
     step=0,
     wandb=None,
     save_dir="checkpoints",
+    is_mini=True,
     **kwargs,
 ):
     os.makedirs(save_dir, exist_ok=True)
 
     moe_path = "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
-    ckp_path = f"{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth"
-    resume_path = f"{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth"
+    mini_path = "mini_" if is_mini else ""
+    ckp_path = f"{save_dir}/{weight}_{mini_path}{lm_config.hidden_size}{moe_path}.pth"
+    resume_path = f"{save_dir}/{weight}_{mini_path}{lm_config.hidden_size}{moe_path}_resume.pth"
 
     if model is not None:
         from torch.nn.parallel import DistributedDataParallel
@@ -210,3 +212,38 @@ class SkipBatchSampler(Sampler):
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
 
         return max(0, total_batches - self.skip_batches)
+class LMForRewardModel:
+    def __init__(self, model_path, device="cuda", dtype=torch.float16):
+        # InternLM2 reward 模型：tokenizer 只有 tokenizer.model（SPM），无 tokenizer.json。
+        # transformers 4.57 的 fast 路径强制走 tiktoken（需 tokenizer.json）→ 失败；
+        # 必须 use_fast=False 走 slow/SPM 路径（要求 sentencepiece 0.1.x，0.2.x 无法解析旧 SPM）。
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=True, use_fast=False
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"reward 模型 tokenizer 加载失败：{e}\n"
+                f"InternLM2 reward 模型只有 tokenizer.model（SPM），需要 use_fast=False + sentencepiece 0.1.x。\n"
+                f"若报 'piece must not include null character'，请降级：pip install \"sentencepiece==0.1.99\""
+            ) from e
+        if not hasattr(self.tokenizer, "apply_chat_template"):
+            raise RuntimeError(
+                f"reward 模型 tokenizer 加载异常：返回了 {type(self.tokenizer).__name__}，"
+                f"模型目录可能缺少 tokenizer.json，请从官方仓库补全后重试。"
+            )
+        self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True)
+        self.model = self.model.to(device).eval()
+        self.device = device
+
+    @torch.no_grad()
+    def get_score(self, messages, response):
+        history_text = "\n".join([f"{m['role']}: {m['content']}" for m in messages[:-1]])
+        last_query = messages[-1]['content'] if messages else ""
+        message_context = f"{history_text}\n以上是对话历史。我的新问题是：\n{last_query}" if history_text else last_query
+        eval_messages = [
+            {"role": "user", "content": message_context},
+            {"role": "assistant", "content": response}
+        ]
+        score = self.model.get_score(self.tokenizer, eval_messages)
+        return max(min(score, 3.0), -3.0)
