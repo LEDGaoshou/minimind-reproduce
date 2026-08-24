@@ -72,9 +72,10 @@ class TorchRolloutEngine(RolloutEngine):
         model = self.policy_model.module if isinstance(self.policy_model, DistributedDataParallel) else self.policy_model
         ctx = self.autocast_ctx if self.autocast_ctx else nullcontext()
         with torch.no_grad(), ctx:
+            # 不传 attention_mask：模型内部走 FlashAttention(is_causal)，避免 O(seq^2) 显存；
+            # left-pad 的 pad 位置不参与 loss（训练侧由 completion_mask 屏蔽），此处可忽略
             output_ids = model.generate(
                 input_ids=prompt_ids.repeat_interleave(num_generations, dim=0),
-                attention_mask=attention_mask.repeat_interleave(num_generations, dim=0),
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=temperature,
@@ -84,8 +85,7 @@ class TorchRolloutEngine(RolloutEngine):
             ).clone()  # [B*num_gen, P+R]
             prompt_len = prompt_ids.size(1)
             completion_ids = output_ids[:, prompt_len:]  # [B*num_gen, R]
-            full_mask = (output_ids != self.tokenizer.pad_token_id).long()
-            per_token_logps = compute_per_token_logps(self.policy_model, output_ids, completion_ids.size(1), attention_mask=full_mask)
+            per_token_logps = compute_per_token_logps(self.policy_model, output_ids, completion_ids.size(1), attention_mask=None)
         completions = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
         return RolloutResult(output_ids, completion_ids, per_token_logps, completions,
                              prompt_ids.new_full((output_ids.size(0),), prompt_len),
