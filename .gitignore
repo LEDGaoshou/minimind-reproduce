@@ -222,3 +222,6 @@ data/
 out/
 swanlog/
 code/model/internlm2-1_8b-reward
+minimind-3-sft/
+minimind-3-grpo/
+minimind-3-dpo/
